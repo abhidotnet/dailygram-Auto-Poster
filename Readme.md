@@ -24,15 +24,16 @@ Perfect for creators who want true **set-it-and-forget-it** daily posting.
 ## Project Structure
 
 ```text
-dailygram-auto-poster/ 
-├── README.md 
-├── deployment/ 
-│   └── deploy.sh              # Bash deployment script 
-│   └── deploy.ps1             # Windows deployment script 
-├── infra/ 
-│   └── template.yaml          # CloudFormation infrastructure 
-└── lambda/ 
-    └── lambda_post_instagram.py 
+dailygram-auto-poster/
+├── README.md
+├── deployment/
+│   ├── deploy.sh              # Bash deployment script
+│   └── deploy.ps1             # Windows deployment script
+├── infra/
+│   └── template.yaml          # CloudFormation infrastructure
+└── lambda/
+    └── lambda_post_instagram.py
+```
 
 ## Prerequisites
 
@@ -45,15 +46,23 @@ dailygram-auto-poster/
 
 ## Deployment
 
-### One-Command Deploy *CHOOSE DEPLOY BASED ON OPERATING SYSTEM*
+### One-Command Deploy
+
+Choose the deploy script for your operating system.
 
 From the root of the project, run:
 
+**Linux / macOS:**
+
 ```bash
 ./deployment/deploy.sh
-```windows
+```
+
+**Windows:**
+
+```powershell
 ./deployment/deploy.ps1
-	
+```
 
 This script will:
 
@@ -78,13 +87,19 @@ The scheduler will run daily at 2:30 PM Eastern Time (America/New_York).
 ---
 
 ## Updating the Code
-
 To update your Lambda function:
 
 1. Edit `lambda/lambda_post_instagram.py`
 2. Run the deploy script again:
-   ```bash
-   ./deployment/deploy.sh
-   ```windows
-   ./deployment/deploy.ps1
- 
+
+**Linux / macOS:**
+
+```bash
+./deployment/deploy.sh
+```
+
+**Windows:**
+
+```powershell
+./deployment/deploy.ps1
+```
