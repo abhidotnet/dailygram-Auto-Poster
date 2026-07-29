@@ -1,0 +1,152 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Daily Instagram Auto-Poster - Lambda + S3 + EventBridge Scheduler
+
+Parameters:
+  BucketName:
+    Type: String
+    Default: instagram-posts-bucket
+    Description: Name of the S3 bucket for uploads and processed files
+
+Resources:
+  # ================== Deployment Bucket (for lambda.zip) ==================
+  DeploymentBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "\${BucketName}-deployment-\${AWS::AccountId}"
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireOldZips
+            Status: Enabled
+            ExpirationInDays: 30
+
+  # ================== Main Content Bucket ==================
+  InstagramBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref BucketName
+      LifecycleConfiguration:
+        Rules:
+          - Id: MoveToProcessed
+            Status: Enabled
+            Prefix: uploads/
+            ExpirationInDays: 90
+
+  # ================== IAM Policies ==================
+  LambdaS3Policy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: InstagramLambdaS3Policy
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: s3:ListBucket
+            Resource: !GetAtt InstagramBucket.Arn
+            Condition:
+              StringLike:
+                s3:prefix: ["uploads/*", "processed/*"]
+          - Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:PutObject
+              - s3:DeleteObject
+            Resource: !Sub "\${InstagramBucket.Arn}/*"
+
+  LambdaSecretsPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: InstagramSecretsPolicy
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - secretsmanager:GetSecretValue
+              - secretsmanager:DescribeSecret
+            Resource: !Sub "arn:aws:secretsmanager:\${AWS::Region}:\${AWS::AccountId}:secret:instagram_api_token-*"
+
+  # ================== IAM Roles ==================
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: instagram-poster-lambda-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - !Ref LambdaS3Policy
+        - !Ref LambdaSecretsPolicy
+
+  EventBridgeSchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: EventBridgeSchedulerInvokeLambdaRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokeLambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt InstagramPosterLambda.Arn
+
+  # ================== Lambda Function ==================
+  InstagramPosterLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: automated-instagram-posting
+      Runtime: python3.12
+      Handler: lambda_function.lambda_handler
+      MemorySize: 256
+      Timeout: 90
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref BucketName
+          SECRET_ID: instagram_api_token
+      Code:
+        S3Bucket: !Ref DeploymentBucket
+        S3Key: lambda.zip
+      Layers:
+        - !Sub "arn:aws:lambda:\${AWS::Region}:\${AWS::AccountId}:layer:requests-py312:1"   # Change layer name/version if yours is different
+
+  # ================== EventBridge Scheduler ==================
+  DailyInstagramSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: post-instagram-230pm-et
+      State: ENABLED
+      ScheduleExpression: "cron(30 14 * * ? *)"
+      ScheduleExpressionTimezone: "America/New_York"
+      FlexibleTimeWindow:
+        Mode: OFF
+      Target:
+        Arn: !GetAtt InstagramPosterLambda.Arn
+        RoleArn: !GetAtt EventBridgeSchedulerRole.Arn
+        RetryPolicy:
+          MaximumEventAgeInSeconds: 86400
+          MaximumRetryAttempts: 3
+
+Outputs:
+  BucketName:
+    Description: S3 Bucket for uploads/ and processed/
+    Value: !Ref InstagramBucket
+  LambdaFunctionName:
+    Description: Main Instagram posting Lambda
+    Value: !Ref InstagramPosterLambda
+  ScheduleName:
+    Description: Daily scheduler name
+    Value: !Ref DailyInstagramSchedule
+    
