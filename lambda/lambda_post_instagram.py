@@ -12,6 +12,7 @@ import urllib.error as urlerror
 from urllib.parse import urlsplit, parse_qsl, urlunsplit
 
 import boto3
+from botocore.client import Config
 from botocore.exceptions import BotoCoreError, ClientError
 from botocore.response import StreamingBody
 
@@ -28,7 +29,7 @@ class LambdaResponse(TypedDict):
     statusCode: int
     body: str
 
-MediaType = Literal["IMAGE", "VIDEO"]
+MediaType = Literal["IMAGE", "REELS"]
 
 
 # ---------- Config ----------
@@ -123,28 +124,30 @@ def _http_post(url: str, data: Mapping[str, Any], timeout: int = HTTP_TIMEOUT) -
     except urlerror.HTTPError as e:
         body = e.read() if hasattr(e, "read") else b""
         body_len = len(body or b"")
-        ig_summary: dict[str, Any] = {}
-        try:
-            j = json.loads(body.decode("utf-8"))
-            if isinstance(j, dict) and isinstance(j.get("error"), dict):
-                err = j["error"]
-                ig_summary = {
-                    "code": err.get("code"),
-                    "subcode": err.get("error_subcode"),
-                    "type": err.get("type"),
-                    # Log only message length
-                    "message_len": len(err.get("message") or ""),
-                }
-        except Exception:
-            pass
+        ig_error = _parse_ig_error(body)
         logger.error(
             "%s - HTTP POST %s failed: %s body_len=%d ig_error=%s fields=%s",
-            _now_iso(), url, e, body_len, ig_summary, _field_lengths(data)
+            _now_iso(), url, e, body_len, ig_error, _field_lengths(data),
         )
         return None
     except Exception as exc:
         logger.error("%s - HTTP POST failed (%s): %s | fields=%s", _now_iso(), url, exc, _field_lengths(data))
         return None
+
+def _parse_ig_error(body: bytes | bytearray | str | None) -> Optional[dict[str, Any]]:
+    """Extract Instagram Graph API error object from a response body, if present."""
+    if not body:
+        return None
+    try:
+        raw = body.decode("utf-8") if isinstance(body, (bytes, bytearray)) else body
+        j = json.loads(raw)
+        if isinstance(j, dict) and isinstance(j.get("error"), dict):
+            return cast(dict[str, Any], j["error"])
+        if isinstance(j, dict):
+            return j
+    except Exception:
+        return None
+    return None
 
 def _http_get_json(url: str, timeout: int = HTTP_TIMEOUT) -> Optional[dict[str, Any]]:
     """GET JSON helper (used for video status polling). Logs redacted query details only."""
@@ -163,7 +166,11 @@ def _http_get_json(url: str, timeout: int = HTTP_TIMEOUT) -> Optional[dict[str, 
     except urlerror.HTTPError as e:
         body = e.read() if hasattr(e, "read") else b""
         base, q_lens = _redacted_url_for_log(url)
-        logger.error("%s - HTTP GET %s failed: %s body_len=%d query_fields=%s", _now_iso(), base, e, len(body or b""), q_lens)
+        ig_error = _parse_ig_error(body)
+        logger.error(
+            "%s - HTTP GET %s failed: %s body_len=%d ig_error=%s query_fields=%s",
+            _now_iso(), base, e, len(body or b""), ig_error, q_lens,
+        )
         return None
     except Exception as exc:
         base, q_lens = _redacted_url_for_log(url)
@@ -374,7 +381,8 @@ def get_instagram_secrets(secret_name: str = SECRET_NAME) -> tuple[Optional[str]
 def get_media_type_from_ext(key: str) -> MediaType:
     ext = os.path.splitext(key)[1].lower()
     if ext in VIDEO_EXTS:
-        return "VIDEO"
+        # Instagram deprecated media_type=VIDEO; videos publish as Reels
+        return "REELS"
     return "IMAGE"
 
 def create_media_container(access_token: str, instagram_account_id: str, media_url: str, caption: str, media_type: MediaType) -> Optional[dict[str, Any]]:
@@ -384,10 +392,8 @@ def create_media_container(access_token: str, instagram_account_id: str, media_u
     if media_type == "IMAGE":
         payload["image_url"] = media_url
     else:
-        payload["media_type"] = "VIDEO"
+        payload["media_type"] = "REELS"
         payload["video_url"] = media_url
-        payload["video_codec"] = "h264" 
-        payload["video_format"] = "mp4"
     logger.info(
         "%s - create_media_container type=%s account_id length=%d caption length=%d media_url length=%d token length=%d",
         _now_iso(), media_type, len(instagram_account_id), len(caption), len(media_url), len(access_token),
@@ -454,7 +460,11 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> LambdaResponse:
             logger.error("%s - Instagram config missing", _now_iso())
             return _err("Server misconfiguration: Instagram credentials missing", 500)
 
-        s3_client: S3Client = boto3.client("s3")  # type: ignore[assignment]
+        # s3v4 signatures produce URLs Instagram Graph API can fetch reliably
+        s3_client: S3Client = boto3.client(
+            "s3",
+            config=Config(signature_version="s3v4"),
+        )  # type: ignore[assignment]
 
         keys = list_media_files(s3_client, bucket, UPLOADS_FOLDER)
         media_candidates = filter_media_keys(keys)
@@ -489,21 +499,35 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> LambdaResponse:
             if not ok:
                 return reject_media_and_caption(s3_client, bucket, media_key, caption_key, reason)
 
-        # Generate presigned URL that Instagram Graph API reliably accepts
-        s3_config = boto3.session.Session().get_component("s3")
-        media_url = s3_client.generate_presigned_url(
-            "get_object",
-            Params={
-                "Bucket": bucket,
-                "Key": media_key,
-            },
-            ExpiresIn=3600,
-            # Instagram prefers this style
-            HttpMethod="GET",
-        )
+        # Presigned GET URL so Instagram can pull the object from S3 (no public bucket needed)
+        expires_in = 3600
         logger.info(
-            "%s - generated presigned_url length=%d (first 80 chars: %s...)",
-            _now_iso(), len(media_url), media_url[:80]
+            "%s - generating presigned URL bucket=%s key=%s media_type=%s expires_in=%d",
+            _now_iso(), bucket, media_key, media_type, expires_in,
+        )
+        try:
+            media_url = s3_client.generate_presigned_url(
+                "get_object",
+                Params={"Bucket": bucket, "Key": media_key},
+                ExpiresIn=expires_in,
+                HttpMethod="GET",
+            )
+        except Exception as exc:
+            logger.exception(
+                "%s - failed to generate presigned URL bucket=%s key=%s: %s",
+                _now_iso(), bucket, media_key, exc,
+            )
+            return _err("Failed to generate media URL", 500)
+
+        # Log host/path only — query string contains the signature
+        url_parts = urlsplit(media_url)
+        logger.info(
+            "%s - generated presigned_url host=%s path=%s query_params=%d url_length=%d",
+            _now_iso(),
+            url_parts.netloc,
+            url_parts.path,
+            len(parse_qsl(url_parts.query)),
+            len(media_url),
         )
 
         create_resp = create_media_container(access_token, instagram_account_id, media_url, caption, media_type)
@@ -521,7 +545,7 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> LambdaResponse:
             return _err("Invalid creation response", 502)
 
         # Wait until IG finishes processing the container (images can also return 9007 if published too soon)
-        max_wait = 180 if media_type == "VIDEO" else 60
+        max_wait = 180 if media_type == "REELS" else 60
         if not poll_container_status(access_token, creation_id, max_wait_seconds=max_wait):
             logger.error("%s - media container did not reach FINISHED", _now_iso())
             return _err("Media container not ready for publish", 502)
