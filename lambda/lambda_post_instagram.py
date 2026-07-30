@@ -55,8 +55,18 @@ MAX_IMAGE_BYTES: Final[int] = 8 * 1024 * 1024
 
 
 # ---------- Logging ----------
+def _env_flag(name: str, default: bool = True) -> bool:
+    """Parse a boolean env var. Unset/empty uses default (TRUE by default)."""
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+# ENABLE_LOGGING defaults to TRUE when unset; set to FALSE to silence INFO/DEBUG logs
+ENABLE_LOGGING: Final[bool] = _env_flag("ENABLE_LOGGING", default=True)
+
 logger = logging.getLogger("lambda_post_instagram")
-logger.setLevel(logging.INFO)
+logger.setLevel(logging.INFO if ENABLE_LOGGING else logging.ERROR)
 if not logger.handlers:
     _h = logging.StreamHandler()
     _h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s - %(message)s"))
@@ -445,8 +455,8 @@ def lambda_handler(event: Mapping[str, Any], context: Any) -> LambdaResponse:
     """AWS Lambda entrypoint."""
     try:
         logger.info(
-            "%s - invocation start BUCKET_NAME=%s AWS_REGION=%s event_keys=%s",
-            _now_iso(), BUCKET_NAME, os.getenv("AWS_REGION"),
+            "%s - invocation start BUCKET_NAME=%s AWS_REGION=%s ENABLE_LOGGING=%s event_keys=%s",
+            _now_iso(), BUCKET_NAME, os.getenv("AWS_REGION"), ENABLE_LOGGING,
             list(event.keys()) if isinstance(event, Mapping) else type(event).__name__,
         )
 
